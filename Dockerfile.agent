@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+
+FROM golang:1.26-bookworm AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath \
+    -ldflags="-X github.com/nekopass/nekopass/internal/release.Version=v0.19.0-docker" \
+    -o /out/nekopass-agent ./cmd/nekopass-agent
+
+FROM debian:bookworm-slim
+ARG APP_UID=10002
+ARG APP_GID=10002
+RUN groupadd --gid ${APP_GID} nekopass-agent \
+    && useradd --uid ${APP_UID} --gid ${APP_GID} --create-home --home-dir /nonexistent --shell /usr/sbin/nologin nekopass-agent \
+    && apt-get update \
+    && apt-get install --no-install-recommends --yes ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && install -d -o nekopass-agent -g nekopass-agent /var/lib/nekopass-agent
+COPY --from=builder /out/nekopass-agent /opt/nekopass-agent
+USER nekopass-agent
+VOLUME ["/var/lib/nekopass-agent"]
+ENTRYPOINT ["/opt/nekopass-agent"]
+CMD ["-state", "/var/lib/nekopass-agent/state.db"]

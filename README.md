@@ -43,6 +43,32 @@ Nekopass是一个开源免费的转发面板，设计参考了nyanpass，但是�
 - 兼容 nyanpass导出的规则格式，转发规则可以从nyanpass无缝迁移
 - 提供一键安装、CLI 服务管理，以及面板和节点在线更新。
 
+## Docker Compose 部署
+
+仓库提供本地构建的 Docker/Compose 方案，面板与 PostgreSQL 默认启动，Agent 使用 `agent` profile 单独运行。该方案不是上游官方镜像，镜像会从当前源码构建。
+
+```bash
+cp .env.example .env
+# 修改 .env 中的 POSTGRES_PASSWORD
+
+docker compose build
+docker compose up -d postgres panel
+
+# 首次创建管理员（密码至少 12 个字符）
+docker compose run --rm panel /opt/nekopass/bin/nekopass \
+  -mode bootstrap -admin-name admin -random-password
+
+# 查看状态与日志
+docker compose ps
+docker compose logs -f panel
+```
+
+面板端口：`8080`（Web）和 `9443`（Agent gRPC）。生产环境建议在外部 Ingress/Nginx/Caddy 终止 Web TLS，并为 Agent gRPC 单独提供 TLS 或受控入口。Agent 每个转发节点必须使用独立状态卷；如需在 Compose 中运行 Agent，先设置 `NEKOPASS_SERVER` 和 `NEKOPASS_NODE_TOKEN`，再执行：
+
+```bash
+docker compose --profile agent up -d agent
+```
+
 ## 安装面板
 
 Debian / Ubuntu，amd64 / arm64：

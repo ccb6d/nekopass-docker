@@ -1,0 +1,19 @@
+# Git
+.git
+.gitmodules
+
+# Go
+**/*.test
+coverage.out
+
+# Node
+web/node_modules
+web/dist
+npm-debug.log*
+
+# Local/runtime
+.local
+dist
+.env
+*.log
+*.db
