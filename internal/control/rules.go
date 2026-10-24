@@ -352,7 +352,9 @@ func (s *Server) rules(w http.ResponseWriter, r *http.Request) {
  WHEN r.egress_group_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM rule_outbound_routes o WHERE o.rule_id=r.id) THEN 'unauthorized'
  WHEN r.egress_group_id IS NOT NULL AND n.protocol_version<24 THEN 'upgrade_required'
  WHEN r.egress_group_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM rule_outbound_routes o JOIN nodes x ON x.id=o.egress_node_id WHERE o.rule_id=r.id AND x.protocol_version>=24) THEN 'upgrade_required'
- WHEN u.quota_bytes>=0 AND (u.quota_bytes<=u.traffic_base_bytes+COALESCE((SELECT sum(traffic) FROM current_grants WHERE user_id=u.id),0) OR u.quota_bytes<u.traffic_base_bytes+COALESCE((SELECT sum(issued-released+unlimited_spent) FROM current_grants WHERE user_id=u.id),0)) THEN 'quota_exhausted'
+ WHEN n.protocol_version<25 AND r.egress_group_id IS NULL AND n.ingress_rate+COALESCE(en.egress_rate,0)<>10000 THEN 'upgrade_required'
+ WHEN n.protocol_version<25 AND r.egress_group_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM rule_outbound_routes o JOIN nodes x ON x.id=o.egress_node_id WHERE o.rule_id=r.id AND n.ingress_rate+x.egress_rate=10000) THEN 'upgrade_required'
+ WHEN u.quota_bytes>=0 AND (r.egress_group_id IS NULL AND n.ingress_rate+COALESCE(en.egress_rate,0)>0 OR r.egress_group_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM rule_outbound_routes o JOIN nodes x ON x.id=o.egress_node_id WHERE o.rule_id=r.id AND n.ingress_rate+x.egress_rate=0)) AND (u.quota_bytes<=u.traffic_base_bytes+COALESCE((SELECT sum(charged_bytes) FROM current_grants WHERE user_id=u.id),0) OR u.quota_bytes<u.traffic_base_bytes+COALESCE((SELECT sum(issued-released+unlimited_spent) FROM current_grants WHERE user_id=u.id),0)) THEN 'quota_exhausted'
  WHEN r.egress_group_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM rule_outbound_routes o JOIN nodes x ON x.id=o.egress_node_id WHERE o.rule_id=r.id AND x.protocol_version>=24 AND x.last_seen>now()-interval '12 seconds') THEN 'offline'
 	 WHEN n.last_seen IS NULL OR n.last_seen<now()-interval '12 seconds' OR (en.id IS NOT NULL AND (en.last_seen IS NULL OR en.last_seen<now()-interval '12 seconds')) THEN 'offline'
 	 WHEN $3 AND (n.protocol_version<14 OR (en.id IS NOT NULL AND en.protocol_version<14)) THEN 'upgrade_required'
@@ -372,15 +374,9 @@ func (s *Server) rules(w http.ResponseWriter, r *http.Request) {
 		s.dbError(w, e)
 		return
 	}
-	v, e := pgx.CollectRows(rows, pgx.RowToMap)
-	if e != nil {
-		s.dbError(w, e)
-		return
-	}
-	for _, rule := range v {
+	s.sendRowsWith(w, rows, nil, func(rule map[string]any) {
 		rule["proxy_trusted_cidrs"] = settings.ProxyTrustedCIDRs
-	}
-	writeJSON(w, 200, v)
+	})
 }
 func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request) {
 	id, validID := resourceID(w, r)
