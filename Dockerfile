@@ -10,6 +10,7 @@ RUN npm run build --prefix web
 FROM golang:1.26-bookworm AS go-builder
 WORKDIR /src
 COPY go.mod go.sum ./
+COPY third_party/quic-go ./third_party/quic-go
 RUN go mod download
 COPY . .
 COPY --from=web-builder /src/web/dist ./web/dist
