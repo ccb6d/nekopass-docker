@@ -24,7 +24,7 @@ var errTunnelTarget = errors.New("tunnel target unavailable")
 func peerRule(r *pb.Rule, p *pb.EgressPeer) *pb.Rule {
 	// Dialing needs only authentication and peer configuration. Cloning the
 	// entire rule here would copy every peer's certificate once per candidate.
-	return &pb.Rule{Id: r.Id, UserId: r.UserId, IngressNodeId: r.IngressNodeId, QuotaEpoch: r.QuotaEpoch, Protocol: r.Protocol, TrafficRate: p.TrafficRate, MeteringConfigured: r.MeteringConfigured, EgressNodeId: p.NodeId, TunnelHost: p.Host, TunnelPort: p.Port, TunnelToken: p.Token, TunnelProtocol: p.Protocol, Tls: p.Tls}
+	return &pb.Rule{Id: r.Id, UserId: r.UserId, IngressNodeId: r.IngressNodeId, QuotaEpoch: r.QuotaEpoch, Protocol: r.Protocol, TrafficRate: p.TrafficRate, MeteringConfigured: r.MeteringConfigured, EgressNodeId: p.NodeId, TunnelHost: p.Host, TunnelPort: p.Port, TunnelToken: p.Token, TunnelProtocol: p.Protocol, Tls: p.Tls, Random: p.Random, Congestion: p.Congestion, Mux: p.Mux}
 }
 func peerKey(r *pb.Rule) string {
 	return fmt.Sprint(r.EgressNodeId) + "/" + r.TunnelToken + "/" + h2PoolKey(r)
@@ -255,7 +255,7 @@ func (m *egressManager) outcomeLocked(key string, err error) {
 	if h == nil {
 		return
 	}
-	if errors.Is(err, errTunnelTarget) {
+	if errors.Is(err, errTunnelTarget) || errors.Is(err, errMuxCapacity) || errors.Is(err, errMuxDraining) {
 		return
 	}
 	// Update group-specific hysteresis even while there is no user traffic.
@@ -331,11 +331,23 @@ func dialEgress(ctx, lifetime context.Context, r *pb.Rule, target string, udp bo
 	if udp {
 		return dialDatagramTunnel(ctx, lifetime, r, target, h2, queued)
 	}
+	if tunnel.H3(r.TunnelProtocol) {
+		if h2 == nil {
+			return nil, errors.New("HTTP/3 transport unavailable")
+		}
+		return h2.h3.Dial(ctx, lifetime, r, target, false, queued)
+	}
 	if tunnel.H2(r.TunnelProtocol) {
 		if h2 == nil {
 			return nil, errors.New("HTTP/2 transport unavailable")
 		}
 		return h2.Dial(ctx, lifetime, r, target)
+	}
+	if r.Mux.GetEnabled() && tunnel.Raw(r.TunnelProtocol) {
+		if h2 == nil {
+			return nil, errors.New("Mux unavailable")
+		}
+		return h2.rawMux.Dial(ctx, lifetime, r, target, false)
 	}
 	return dialTunnel(ctx, r, target)
 }

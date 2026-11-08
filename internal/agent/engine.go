@@ -22,6 +22,7 @@ import (
 	"github.com/nekopass/nekopass/internal/networkpolicy"
 	pb "github.com/nekopass/nekopass/internal/protocol"
 	"github.com/nekopass/nekopass/internal/release"
+	"github.com/quic-go/quic-go/brutal"
 	"golang.org/x/time/rate"
 	"google.golang.org/protobuf/proto"
 )
@@ -34,6 +35,12 @@ type listener struct {
 	cancel  context.CancelFunc
 }
 type Engine struct {
+	muxMu       sync.Mutex
+	muxCarriers map[string]int
+	muxTotal    int
+
+	clientTCPBrutal  *clientTCPBrutal
+	brutalBudget     *brutal.Budget
 	mu               sync.Mutex
 	state            *State
 	users            map[int64]*Account
@@ -45,6 +52,7 @@ type Engine struct {
 	udpNonceMu       sync.Mutex
 	udpNonces        map[string]time.Time
 	nativeUDP        *nativeUDPListener
+	randomUDP        *randomUDPListener
 	counters         map[int64]*atomic.Int64
 	revision         int64
 	syncError        string
@@ -59,6 +67,7 @@ type Engine struct {
 	tunnelPolicy     atomic.Pointer[tunnelPolicy]
 	egress           *egressManager
 	h2               *h2Transport
+	h3Listener       *h3Listener
 	h2Certificate    atomic.Pointer[tls.Certificate]
 	acmeAck          atomic.Int64
 	challengeServers map[int32]*http.Server
@@ -84,6 +93,10 @@ var buffers = sync.Pool{New: func() any { b := make([]byte, BufferSize); return 
 func NewEngine(s *State, maxConnections int64) (*Engine, error) {
 	e := &Engine{state: s, users: map[int64]*Account{}, retired: map[string]*Account{}, listeners: map[int64]*listener{}, counters: map[int64]*atomic.Int64{}}
 	e.h2 = newH2Transport()
+	e.clientTCPBrutal = newClientTCPBrutal()
+	e.brutalBudget = brutal.NewBudget(0)
+	e.h2.h3.brutalBudget = e.brutalBudget
+	e.h2.randomUDP.brutalBudget = e.brutalBudget
 	e.udpListeners = map[int64]*udpListener{}
 	e.udpNonces = map[string]time.Time{}
 	e.ddnsClient = ddns.NewClient
@@ -132,6 +145,12 @@ func (e *Engine) Apply(c *pb.ControlMessage) error {
 	if e.closed {
 		return errors.New("engine closed")
 	}
+	if err := validateMuxControl(c); err != nil {
+		return err
+	}
+	if err := validateBrutalControl(c); err != nil {
+		return err
+	}
 	if c.Node != nil {
 		policy, err := targetPolicy(c.Node.SecurityConfigured, c.Node.TargetDenyCidrs)
 		if err != nil {
@@ -173,6 +192,10 @@ func (e *Engine) Apply(c *pb.ControlMessage) error {
 		old := e.node.Load()
 		restartListeners = old != nil && (old.DialTimeoutSeconds != c.Node.DialTimeoutSeconds || old.IdleTimeoutSeconds != c.Node.IdleTimeoutSeconds || !slices.Equal(old.ProxyTrustedCidrs, c.Node.ProxyTrustedCidrs) || old.SecurityConfigured != c.Node.SecurityConfigured)
 		e.node.Store(proto.Clone(c.Node).(*pb.NodeConfig))
+		if e.clientTCPBrutal != nil {
+			e.clientTCPBrutal.update(c.Node)
+		}
+		e.brutalBudget.SetRate(c.Node.BandwidthUpBps)
 		e.maxConnections.Store(c.Node.MaxConnections)
 		e.configureIPRecovery(c.Node.IpRecovery)
 		e.configureDDNS(c.Node.Ddns)
@@ -352,6 +375,10 @@ func (e *Engine) forwardPrepared(l *listener, client net.Conn, addresses proxyAd
 		return
 	}
 	defer l.runtime.removeIP(ip)
+	if e.clientTCPBrutal != nil {
+		stopBrutal := e.clientTCPBrutal.register(client)
+		defer stopBrutal()
+	}
 	target, release, address, err := l.runtime.dialRoute(ctx)
 	if err != nil {
 		return
@@ -500,6 +527,7 @@ func copyData(ctx context.Context, dst, src net.Conn, a *Account, count *atomic.
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
 				if tcp, ok := dst.(interface{ CloseWrite() error }); ok {
+					_ = dst.SetWriteDeadline(time.Now().Add(5 * time.Second))
 					_ = tcp.CloseWrite()
 				}
 				return nil
@@ -519,7 +547,7 @@ func (e *Engine) Report() (*pb.AgentMessage, error) {
 		a.mu.Lock()
 		defer a.mu.Unlock()
 	}
-	r := &pb.AgentMessage{ProtocolVersion: 25, AgentVersion: release.Version, UpdateSupported: e.updateDirectory != "", UpdateStatus: e.readUpdateStatus(), AcmeAck: e.acmeAck.Load(), Probe: e.probe.Load(), InstanceId: e.state.Instance, AppliedRevision: e.revision, Error: e.syncError, ActiveConnections: e.connections.Load(), DdnsStatus: e.ddnsStatus.Load(), PublicIp: e.publicIP.Load(), IpRecoveryStatus: e.ipRecoveryStatus.Load()}
+	r := &pb.AgentMessage{ProtocolVersion: pb.CurrentVersion, AgentVersion: release.Version, UpdateSupported: e.updateDirectory != "", UpdateStatus: e.readUpdateStatus(), AcmeAck: e.acmeAck.Load(), Probe: e.probe.Load(), InstanceId: e.state.Instance, AppliedRevision: e.revision, Error: e.syncError, ActiveConnections: e.connections.Load(), DdnsStatus: e.ddnsStatus.Load(), PublicIp: e.publicIP.Load(), IpRecoveryStatus: e.ipRecoveryStatus.Load()}
 	pending, err := e.state.RestorePending()
 	if err != nil {
 		return nil, err
@@ -585,6 +613,14 @@ func (e *Engine) Close() {
 		e.tunnel.cancel()
 		e.tunnel.ln.Close()
 		e.tunnel = nil
+	}
+	if e.h3Listener != nil {
+		e.h3Listener.Close()
+		e.h3Listener = nil
+	}
+	if e.randomUDP != nil {
+		e.randomUDP.Close()
+		e.randomUDP = nil
 	}
 	if e.nativeUDP != nil {
 		e.nativeUDP.cancel()

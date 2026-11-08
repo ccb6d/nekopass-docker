@@ -97,7 +97,34 @@ var migration029 string
 //go:embed migration030.sql
 var migration030 string
 
-const CurrentSchemaVersion = 30
+//go:embed migration031.sql
+var migration031 string
+
+//go:embed migration032.sql
+var migration032 string
+
+//go:embed migration033.sql
+var migration033 string
+
+//go:embed migration034.sql
+var migration034 string
+
+//go:embed migration035.sql
+var migration035 string
+
+//go:embed migration036.sql
+var migration036 string
+
+//go:embed migration037.sql
+var migration037 string
+
+//go:embed migration038.sql
+var migration038 string
+
+//go:embed migration039.sql
+var migration039 string
+
+const CurrentSchemaVersion = 39
 
 func CheckSchema(ctx context.Context, p *pgxpool.Pool) error {
 	var version int
@@ -278,6 +305,51 @@ func Migrate(ctx context.Context, p *pgxpool.Pool) error {
 	}
 	if version < 30 {
 		if _, err = tx.Exec(ctx, migration030); err != nil {
+			return err
+		}
+	}
+	if version < 31 {
+		if _, err = tx.Exec(ctx, migration031); err != nil {
+			return err
+		}
+	}
+	if version < 32 {
+		if _, err = tx.Exec(ctx, migration032); err != nil {
+			return err
+		}
+	}
+	if version < 33 {
+		if _, err = tx.Exec(ctx, migration033); err != nil {
+			return err
+		}
+	}
+	if version < 34 {
+		if _, err = tx.Exec(ctx, migration034); err != nil {
+			return err
+		}
+	}
+	if version < 35 {
+		if _, err = tx.Exec(ctx, migration035); err != nil {
+			return err
+		}
+	}
+	if version < 36 {
+		if _, err = tx.Exec(ctx, migration036); err != nil {
+			return err
+		}
+	}
+	if version < 37 {
+		if _, err = tx.Exec(ctx, migration037); err != nil {
+			return err
+		}
+	}
+	if version < 38 {
+		if _, err = tx.Exec(ctx, migration038); err != nil {
+			return err
+		}
+	}
+	if version < 39 {
+		if _, err = tx.Exec(ctx, migration039); err != nil {
 			return err
 		}
 	}

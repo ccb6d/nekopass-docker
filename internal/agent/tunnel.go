@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/nekopass/nekopass/internal/padding"
@@ -27,6 +28,7 @@ type tunnelListener struct {
 	config *pb.ControlMessage
 }
 type tunnelPolicy struct {
+	congestion   map[int64]*pb.TunnelCongestion
 	nativeRoutes map[[16]byte]nativeLink
 	links        map[int64]string
 	rules        map[int64]*pb.EgressRule
@@ -107,6 +109,12 @@ func dialTunnel(ctx context.Context, rule *pb.Rule, target string) (net.Conn, er
 			return nil, e
 		}
 	}
+	if tunnel.Random(rule.TunnelProtocol) {
+		conn, e = dialRandom(ctx, conn, rule)
+		if e != nil {
+			return nil, e
+		}
+	}
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	}
@@ -146,12 +154,14 @@ func dialTunnel(ctx context.Context, rule *pb.Rule, target string) (net.Conn, er
 func policyOf(c *pb.ControlMessage) *tunnelPolicy {
 	p := &tunnelPolicy{links: map[int64]string{}, rules: map[int64]*pb.EgressRule{}, dialTimeout: 8 * time.Second}
 	p.nativeRoutes = map[[16]byte]nativeLink{}
+	p.congestion = map[int64]*pb.TunnelCongestion{}
 	if c.Node != nil && c.Node.DialTimeoutSeconds > 0 {
 		p.dialTimeout = time.Duration(c.Node.DialTimeoutSeconds) * time.Second
 	}
 	for _, link := range c.TunnelLinks {
 		p.links[link.IngressNodeId] = link.Token
-		p.nativeRoutes[nativeRouteTag(link.Token)] = nativeLink{ingress: link.IngressNodeId, key: link.Token}
+		p.congestion[link.IngressNodeId] = link.Congestion
+		p.nativeRoutes[nativeRouteTag(link.Token)] = nativeLink{ingress: link.IngressNodeId, key: link.Token, congestion: link.Congestion}
 	}
 	for _, rule := range c.EgressRules {
 		p.rules[rule.RuleId] = proto.Clone(rule).(*pb.EgressRule)
@@ -160,8 +170,33 @@ func policyOf(c *pb.ControlMessage) *tunnelPolicy {
 }
 
 func (e *Engine) configureTunnel(c *pb.ControlMessage) error {
+	if e.h3Listener != nil {
+		old := e.h3Listener.config
+		if c.Node != nil && c.Node.Enabled && c.Node.TunnelExitEnabled && c.Node.TunnelProtocol == old.TunnelProtocol && e.sameBrutal(old, c) && c.Node.TunnelListenHost == old.TunnelListenHost && c.Node.TunnelListenPort == old.TunnelListenPort && sameH2Listener(old.Tls, c.Node.Tls) && proto.Equal(old.Tls.GetQuicPadding(), c.Node.Tls.GetQuicPadding()) {
+			pair, err := tls.X509KeyPair([]byte(c.Node.Tls.Certificate), []byte(c.Node.Tls.PrivateKey))
+			if err != nil {
+				return err
+			}
+			e.h2Certificate.Store(&pair)
+			e.tunnelPolicy.Store(policyOf(c))
+			return nil
+		}
+		e.h3Listener.Close()
+		e.h3Listener = nil
+	}
+
+	if e.randomUDP != nil {
+		old := e.randomUDP.node
+		if c.Node != nil && c.Node.Enabled && c.Node.TunnelExitEnabled && c.Node.TunnelProtocol == old.TunnelProtocol && e.sameBrutal(old, c) && c.Node.TunnelListenHost == old.TunnelListenHost && c.Node.TunnelListenPort == old.TunnelListenPort && c.Node.UdpIdleTimeoutSeconds == old.UdpIdleTimeoutSeconds && proto.Equal(old.Mux, c.Node.Mux) && proto.Equal(old.Random, c.Node.Random) {
+			e.tunnelPolicy.Store(policyOf(c))
+			return nil
+		}
+		e.randomUDP.Close()
+		e.randomUDP = nil
+	}
+
 	if e.nativeUDP != nil {
-		if c.Node != nil && c.Node.Enabled && c.Node.TunnelExitEnabled && c.Node.TunnelProtocol == e.nativeUDP.node.TunnelProtocol && c.Node.TunnelListenHost == e.nativeUDP.node.TunnelListenHost && c.Node.TunnelListenPort == e.nativeUDP.node.TunnelListenPort {
+		if c.Node != nil && c.Node.Enabled && c.Node.TunnelExitEnabled && c.Node.TunnelProtocol == e.nativeUDP.node.TunnelProtocol && e.sameBrutal(e.nativeUDP.node, c) && proto.Equal(c.Node.Mux, e.nativeUDP.node.Mux) && (!tunnel.TLS(c.Node.TunnelProtocol) || proto.Equal(c.Node.Random, e.nativeUDP.node.Random)) && c.Node.TunnelListenHost == e.nativeUDP.node.TunnelListenHost && c.Node.TunnelListenPort == e.nativeUDP.node.TunnelListenPort {
 			e.tunnelPolicy.Store(policyOf(c))
 			return nil
 		}
@@ -171,7 +206,7 @@ func (e *Engine) configureTunnel(c *pb.ControlMessage) error {
 	}
 	if e.tunnel != nil {
 		old := e.tunnel.config
-		if c.Node != nil && c.Node.Enabled && c.Node.TunnelExitEnabled && old.Node != nil && old.Node.TunnelExitEnabled && old.Node.TunnelProtocol == c.Node.TunnelProtocol && old.Node.TunnelListenHost == c.Node.TunnelListenHost && old.Node.TunnelListenPort == c.Node.TunnelListenPort && sameH2Listener(old.Node.Tls, c.Node.Tls) {
+		if c.Node != nil && c.Node.Enabled && c.Node.TunnelExitEnabled && old.Node != nil && old.Node.TunnelExitEnabled && old.Node.TunnelProtocol == c.Node.TunnelProtocol && old.Node.TunnelListenHost == c.Node.TunnelListenHost && old.Node.TunnelListenPort == c.Node.TunnelListenPort && sameH2Listener(old.Node.Tls, c.Node.Tls) && proto.Equal(old.Node.Mux, c.Node.Mux) && proto.Equal(old.Node.Random, c.Node.Random) {
 			if tunnel.TLS(c.Node.TunnelProtocol) {
 				pair, err := tls.X509KeyPair([]byte(c.Node.Tls.Certificate), []byte(c.Node.Tls.PrivateKey))
 				if err != nil {
@@ -208,8 +243,15 @@ func (e *Engine) configureTunnel(c *pb.ControlMessage) error {
 			return errors.New("TLS certificate not ready")
 		}
 	}
+	if tunnel.H3(c.Node.TunnelProtocol) {
+		e.tunnelPolicy.Store(policyOf(c))
+		return e.startH3(c.Node)
+	}
 	if tunnel.UDP(c.Node.TunnelProtocol) {
 		e.tunnelPolicy.Store(policyOf(c))
+		if tunnel.Random(c.Node.TunnelProtocol) {
+			return e.startRandomUDP(c.Node)
+		}
 		return e.startNativeUDP(c.Node)
 	}
 	ln, err := net.Listen("tcp", address)
@@ -217,6 +259,15 @@ func (e *Engine) configureTunnel(c *pb.ControlMessage) error {
 		return err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	if tunnel.Random(c.Node.TunnelProtocol) {
+		raw := ln
+		ln, err = e.newRandomListener(ctx, ln, c.Node)
+		if err != nil {
+			cancel()
+			raw.Close()
+			return err
+		}
+	}
 	e.tunnel = &tunnelListener{ln: ln, cancel: cancel, config: proto.Clone(c).(*pb.ControlMessage)}
 	e.tunnelPolicy.Store(policyOf(c))
 	if tunnel.H2(c.Node.TunnelProtocol) {
@@ -260,7 +311,13 @@ func (e *Engine) acceptTunnel(ctx context.Context, ln net.Listener) {
 			continue
 		}
 		e.wg.Add(1)
-		go func() { defer e.wg.Done(); defer e.connections.Add(-1); e.handleTunnel(ctx, conn) }()
+		go func() {
+			defer e.wg.Done()
+			var once sync.Once
+			release := func() { once.Do(func() { e.connections.Add(-1) }) }
+			defer release()
+			e.handleTunnel(context.WithValue(ctx, tunnelConnectionLeaseKey{}, release), conn)
+		}()
 	}
 }
 func (e *Engine) handleTunnel(ctx context.Context, upstream net.Conn) {
@@ -306,6 +363,9 @@ func (e *Engine) handleTunnel(ctx context.Context, upstream net.Conn) {
 		return
 	}
 	ingress := int64(binary.BigEndian.Uint64(header[4:12]))
+	if identity := authenticatedIngress(rawUpstream); identity != 0 && identity != ingress {
+		return
+	}
 	ruleID := int64(binary.BigEndian.Uint64(header[12:20]))
 	length := int(binary.BigEndian.Uint16(header[84:86]))
 	if length < 1 || length > 512 {
