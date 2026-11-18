@@ -16,7 +16,9 @@ import tempfile
 import zipfile
 
 ROOT_FILES = {'.gitignore', '.gitattributes', 'README.md', 'CHANGELOG.md', 'SECURITY.md', 'LICENSE',
-              'go.mod', 'go.sum', 'sqlc.yaml', '开发指南.md'}
+              'go.mod', 'go.sum', 'sqlc.yaml', '开发指南.md',
+              # Docker packaging maintained in this fork
+              '.dockerignore', '.env.example', 'Dockerfile', 'Dockerfile.agent', 'docker-compose.yml'}
 SOURCE_DIRS = {'.github', '.githooks', 'api', 'cmd', 'deploy', 'docs', 'internal',
                'scripts', 'tests', 'web', 'third_party'}
 PRIVATE_DIRS = {'.git', '.local', '.tools', 'node_modules', 'dist', '__pycache__',
@@ -115,6 +117,9 @@ def inspect(name, data, mode='100644', known=()):
             findings.append((name, text.count('\n', 0, match.start()) + 1, 'literal-credential'))
     for match in ENV_CREDENTIAL.finditer(text):
         value = match.group(1)
+        # Placeholder shipped in earlier revisions of the Docker .env.example.
+        if name == '.env.example' and value == 'change-this-to-a-long-random-password':
+            continue
         if len(value) >= 8 and not placeholder(value):
             findings.append((name, text.count('\n', 0, match.start()) + 1, 'literal-env-credential'))
     for value in known:
