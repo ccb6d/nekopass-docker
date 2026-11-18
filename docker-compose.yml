@@ -18,7 +18,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: nekopass:local-v0.19.0
+    image: nekopass:local-v0.20.0
     restart: unless-stopped
     depends_on:
       postgres:
@@ -46,7 +46,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.agent
-    image: nekopass-agent:local-v0.19.0
+    image: nekopass-agent:local-v0.20.0
     restart: unless-stopped
     network_mode: host
     cap_add:
